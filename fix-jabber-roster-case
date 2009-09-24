@@ -1,0 +1,176 @@
+#!/usr/bin/perl
+
+use DJabberd::JID;
+use DJabberd::Subscription;
+use DBI;
+use strict;
+use warnings;
+
+die "$0 must be run with a case-folding version of DJabberd\n"
+    unless DJabberd::JID->new('TEST@example.com')->eq(DJabberd::JID->new('test@example.com'));
+
+my $roster = shift @ARGV;
+die "Usage: $0 rosterfile\n" unless defined $roster and -f $roster;
+
+# Note that all work is performed in a transaction for consistency,
+# hence AutoCommit => 0
+my $dbh = DBI->connect(
+    "dbi:SQLite:dbname=$roster", "", "",
+    { RaiseError => 1, PrintError => 0, AutoCommit => 0 }
+);
+
+my $all_dups = $dbh->selectcol_arrayref(<<SQL);
+SELECT LOWER(first.jid)
+  FROM jidmap first
+       JOIN jidmap other
+         ON LOWER(first.jid) = LOWER(other.jid)
+       LEFT JOIN jidmap later
+         ON LOWER(later.jid) = LOWER(first.jid)
+        AND later.jidid > first.jidid
+ GROUP BY first.jid
+HAVING COUNT(DISTINCT other.jid) > 1
+   AND later.jid IS NULL
+ ORDER BY COUNT(DISTINCT other.jid), LOWER(first.jid)
+SQL
+
+for my $name (@{$all_dups}) {
+    warn "Looking at $name\n";
+
+    # Grab the set of dups
+    my $dups = $dbh->selectall_arrayref(<<SQL, undef, $name);
+SELECT jidid, jid FROM jidmap WHERE LOWER(jid) = ?
+SQL
+
+    # For later use, build up the set of JIDs ids to coalesce.
+    my $jidset = "(" . join(",", map {$_->[0]} @$dups) .")";
+    warn "  JID equivalence set is $jidset\n";
+
+    # Since this is the output of LOWER(jid), it is _probably_ already
+    # correct, but we run it through canonicalize to get KC
+    # normalization, etc
+    $name = canonicalize($name);
+    next unless defined $name;
+    warn "  Canonical form is $name\n";
+
+    # Blow away all of the duplicate JIDs, and re-insert the new name
+    $dbh->do("DELETE FROM jidmap WHERE jidid IN $jidset");
+    $dbh->do("INSERT INTO jidmap(jid) VALUES(?)", undef, $name);
+    my $newid = $dbh->last_insert_id(undef, undef, "jidmap", "jidid");
+    warn "  New row id is $newid\n";
+
+    # Next, find all of the places in the roster where the old IDs
+    # showed up, either as userids or contactids
+    my %types = (userid => "contactid", contactid => "userid");
+    for my $column (keys %types) {
+        warn "  Looking for occurrances in $column\n";
+        my $other = $types{$column};
+        # We now generate a list of contacts that any of the JIDs as
+        # the user, (or users who have any of the JIDs as a contact)
+        my $otherlist = $dbh->selectcol_arrayref(<<SQL);
+SELECT $other FROM roster WHERE $column IN $jidset GROUP BY $other
+SQL
+        for my $otherval (@$otherlist) {
+            my $merge = $dbh->selectall_arrayref(<<SQL, { Slice => {} });
+SELECT $column, name, subscription FROM roster WHERE $other = $otherval AND $column IN $jidset ORDER BY $column ASC
+SQL
+            # We now have a set of information to merge together, in $merge
+            warn "    $otherval references JIDs @{[map $_->{$column}, @$merge]} in $column\n";
+            $dbh->do(<<SQL, undef, $newid, $otherval, merge(@$merge));
+INSERT INTO roster($column, $other, name, subscription) VALUES(?, ?, ?, ?)
+SQL
+        }
+    }
+
+    # Delete any references to old JIDs in the roster
+    $dbh->do("DELETE FROM roster WHERE contactid IN $jidset OR userid IN $jidset");
+
+    # Merge roster groups
+    my $grouplist = $dbh->selectcol_arrayref(<<SQL);
+SELECT name FROM rostergroup WHERE userid IN $jidset GROUP BY name
+SQL
+    for my $groupname (@$grouplist) {
+        # Make a new group of this name for the new JID's id
+        $dbh->do("INSERT INTO rostergroup(userid, name) VALUES(?, ?)", undef, $newid, $groupname);
+        my $groupid = $dbh->last_insert_id(undef, undef, "rostergroup", "groupid");
+        # Find all of the distinct contacts in groups of this name in
+        # any of the old JIDs, and add them to the new group
+        my $merge = $dbh->do(<<SQL, undef, $groupid, $groupname);
+INSERT INTO groupitem(groupid, contactid)
+SELECT ?, groupitem.contactid
+  FROM rostergroup
+       JOIN groupitem
+         ON rostergroup.groupid = groupitem.groupid
+ WHERE rostergroup.name = ?
+   AND rostergroup.userid IN $jidset
+ GROUP BY groupitem.contactid
+SQL
+    }
+    # Remove the old groups
+    $dbh->do("DELETE FROM rostergroup WHERE userid IN $jidset");
+
+    # Look for places the any of the old JIDs appeared in other roster
+    # groups, and replace them with the new JID's id
+    $dbh->do(<<SQL, undef, $newid);
+INSERT INTO groupitem(groupid, contactid)
+SELECT groupid, ?
+  FROM groupitem
+ WHERE contactid IN $jidset
+ GROUP BY groupid
+SQL
+    # Remove the old contacts from the groups
+    $dbh->do("DELETE FROM groupitem WHERE contactid IN $jidset");
+
+}
+
+# The above merely handles cases where one JID appears twice; now we
+# iterate though _all_ names, and lower-case them, to catch JIDs which
+# are incorrectly cased but only appear once.
+my $all = $dbh->selectall_arrayref("SELECT jid, jidid FROM jidmap", { Slice => {} });
+for my $row (@{$all}) {
+    # Canonicalize the name.  Since this is the output of LOWER(jid),
+    # it is _probably_ already correct, but we round-trip through
+    # DJabberd::JID to ensure we get KC normalization, and the like
+    my $name = canonicalize($row->{jid});
+    next unless defined $name;
+    next if $name eq $row->{jid};
+    warn "Looking at @{[$row->{jid}]}\n";
+    warn "  Canonical form is $name\n";
+    $dbh->do("UPDATE jidmap SET jid = ? WHERE jidid = ?", undef, $name, $row->{jidid});
+}
+
+$dbh->commit or die "Error commiting changes: ".$dbh->errstr;
+
+
+
+
+sub canonicalize {
+    # Canonicalize the name.  We round-trip through DJabberd::JID to
+    # ensure we get KC normalization, case folding, and the like
+    my $name = shift;
+    my $jid = DJabberd::JID->new($name);
+    unless ($jid) {
+        warn "Can't make canonical form of $name!";
+        return undef;
+    }
+    return $jid->as_string;
+}
+
+sub merge {
+    my (@merge) = @_;
+
+    # Trivial case
+    return ($merge[0]->{name}, $merge[0]->{subscription})
+        if @merge == 1;
+
+    # More complex case; name is arbitrarily picked to be first non-null name, or null
+    my($name) = grep {defined} map {$_->{name}} @merge;
+    @merge = map {DJabberd::Subscription->from_bitmask($_->{subscription})} @merge;
+
+    # to overrides pendout, from overrides pendin
+    my $merged = DJabberd::Subscription->new;
+    $merged->{to}      = 1 if grep {$_->{to}} @merge;
+    $merged->{pendout} = 1 if not $merged->{to} and grep {$_->{pendout}} @merge;
+    $merged->{from}    = 1 if grep {$_->{from}} @merge;
+    $merged->{pendin}  = 1 if not $merged->{from} and grep {$_->{pendin}} @merge;
+    return $name, $merged->as_bitmask;
+}
